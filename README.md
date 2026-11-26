@@ -5,19 +5,28 @@ A local Streamlit app for managing an internship search. Everything is stored on
 
 ## Run it (macOS)
 
+The app uses [uv](https://docs.astral.sh/uv/) to manage Python and dependencies. Install it once:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Then, from the project folder:
+
 ```bash
 cd ~/jobsearch
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-streamlit run app.py
+uv sync
+uv run streamlit run app.py
 ```
 
-Your browser opens at http://localhost:8501. Next time, you only need:
+`uv sync` creates `.venv` and installs the exact versions pinned in `uv.lock`. Your browser opens at
+http://localhost:8501. Next time, you only need:
 
 ```bash
-cd ~/jobsearch && source .venv/bin/activate && streamlit run app.py
+cd ~/jobsearch && uv run streamlit run app.py
 ```
+
+To add a dependency, run `uv add <package>` (this updates `pyproject.toml` and `uv.lock`).
 
 ## Pages
 

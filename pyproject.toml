@@ -1,0 +1,13 @@
+[project]
+name = "jobsearch"
+version = "0.1.0"
+description = "Local Streamlit app for tracking a Summer 2027 internship search"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "streamlit>=1.50",
+    "pandas>=2.0",
+]
+
+[tool.uv]
+package = false
