@@ -58,22 +58,35 @@ To add a dependency, run `uv add <package>` (this updates `pyproject.toml` and `
 
 ## Crawl and refresh
 
-Only sources that publish postings openly are crawled:
+The Dashboard and the Job postings page show the full list of websites under **Websites crawled**. Tick **On**
+for the ones you want and press **Save changes**. Each row shows when it was last crawled, how many matching
+postings it had, how many were new, and whether the last run worked.
 
-- **SimplifyJobs internship list on GitHub** (on by default). The app reads the list's public JSON file and
-  keeps active postings for Summer 2027. To follow another list in the same format, add a "GitHub list"
-  source with its raw JSON URL.
-- **Greenhouse boards**: add a source with the company's board name, the part after
-  `job-boards.greenhouse.io/` in its careers page address (for example `stripe`).
-- **Lever boards**: add a source with the name after `jobs.lever.co/`.
+Press **Check sources** to test every website: the ones that respond are turned on and the ones that fail are
+turned off, with the reason in **Status**. Nothing is saved to your postings during a check.
 
-For Greenhouse and Lever, only titles that mention intern, internship or co-op are kept. Crawled postings from
-the GitHub list have no job description, so they are scored on title, category and term only. Expect scores
-around 40-60, and paste a description in to get a sharper score.
+Websites in the list:
 
-Handshake, LinkedIn, Indeed and similar sites need a login or forbid automated access in their terms, so the
-app does not crawl them. Use the saved searches on **Job sites**, and add postings from those sites by hand or
-by CSV import.
+- **GitHub lists** (on by default): SimplifyJobs Summer 2027, vanshb03 Summer 2027 and SpeedyApply 2027 SWE
+  college jobs. A SimplifyJobs off-season list (Fall 2026 to Spring 2027) is included but off.
+- **Job board APIs** (off until checked): The Muse internships, Remotive and RemoteOK remote internships, and
+  USAJobs student internships. USAJobs needs a free API key from developer.usajobs.gov; add
+  `USAJOBS_API_KEY=...` and `USAJOBS_EMAIL=...` to your `.env` file.
+- **Company boards** (off until checked): about 20 companies on Greenhouse, Lever and Ashby, such as Stripe,
+  Databricks, Figma, Cloudflare, Palantir, Notion and Ramp. Add any company with **Add a website**, using
+  the name in its careers page address (`job-boards.greenhouse.io/<name>`, `jobs.lever.co/<name>` or
+  `jobs.ashbyhq.com/<name>`).
+
+From job boards and company boards, only titles that mention intern, internship or co-op are kept. The same
+job is often in several lists, so a posting is skipped when its link, or its company and title, is already
+saved.
+
+GitHub-list postings have no job description, so they are scored on title, category and term only. Expect
+scores around 40-60, and paste a description in to get a sharper score.
+
+**Websites not crawled** lists Handshake, LinkedIn, Indeed, Internships.com, Glassdoor, Wellfound, WayUp and
+RippleMatch with a link to search each one. They need a login or forbid automated access in their terms, so
+the app does not crawl them. Add postings from them by hand or by CSV import.
 
 ## Tailoring your resume
 
@@ -114,7 +127,8 @@ Everything lives in one SQLite file, `data/jobsearch.db`, created on first run. 
 - `postings`: job postings you have found, with their relevance score, matched skills, the reasons for the
   score, a status (New, Saved, Dismissed, Added to applications), where it came from (`origin`) and a link to
   the application made from it.
-- `crawl_sources`: the feeds that Crawl and refresh reads, with the result of the last run.
+- `crawl_sources`: the websites that Crawl and refresh reads, whether each is on, and the result of the last
+  run or check.
 - `profile`: your resume text, used for tailoring.
 - `tailored_resumes`: each saved tailored version, with the job description, method, list of changes and
   missing keywords, linked to its posting or application.

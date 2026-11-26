@@ -43,6 +43,11 @@ SOURCES = [
     "Indeed",
     "Simplify",
     "GitHub list (SimplifyJobs)",
+    "GitHub internship list",
+    "The Muse",
+    "Remotive",
+    "RemoteOK",
+    "USAJobs",
     "Wellfound",
     "WayUp",
     "RippleMatch",
@@ -204,11 +209,21 @@ def init_db() -> None:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(postings)")}
         if "origin" not in cols:
             conn.execute("ALTER TABLE postings ADD COLUMN origin TEXT DEFAULT 'manual'")
-        if conn.execute("SELECT COUNT(*) FROM crawl_sources").fetchone()[0] == 0:
-            conn.executemany(
-                "INSERT INTO crawl_sources (kind, name, target) VALUES (?, ?, ?)",
-                [("simplify", "SimplifyJobs Summer 2027 list (GitHub)", crawler.SIMPLIFY_DEFAULT_URL)],
-            )
+        src_cols = {r["name"] for r in conn.execute("PRAGMA table_info(crawl_sources)")}
+        for col, typ in (("preset", "TEXT"), ("term", "TEXT"), ("last_found", "INTEGER")):
+            if col not in src_cols:
+                conn.execute(f"ALTER TABLE crawl_sources ADD COLUMN {col} {typ}")
+        # The first version created one unlabeled SimplifyJobs source; mark it as that preset.
+        conn.execute("UPDATE crawl_sources SET preset='simplify-summer-2027', term='Summer 2027' "
+                     "WHERE preset IS NULL AND kind='simplify' AND target=?", (crawler.SIMPLIFY_DEFAULT_URL,))
+        have = {r[0] for r in conn.execute("SELECT preset FROM crawl_sources WHERE preset IS NOT NULL")}
+        row = conn.execute("SELECT value FROM profile WHERE key='removed_presets'").fetchone()
+        removed = set(json.loads(row[0])) if row else set()
+        conn.executemany(
+            "INSERT INTO crawl_sources (preset, kind, name, target, term, enabled) VALUES (?, ?, ?, ?, ?, ?)",
+            [(k, kind, name, target, term, int(on)) for k, kind, name, target, term, on in crawler.PRESETS
+             if k not in have and k not in removed],
+        )
 
 
 APP_COLUMNS = [
@@ -408,41 +423,73 @@ def insert_posting(record: dict, conn: sqlite3.Connection | None = None) -> int:
         return c.execute(sql, params).lastrowid
 
 
-CRAWL_KINDS = {"simplify": "GitHub list (SimplifyJobs format)", "greenhouse": "Greenhouse board",
-               "lever": "Lever board"}
+POSTING_SOURCE_FOR_KIND = {
+    "simplify": "GitHub internship list", "github_readme": "GitHub internship list", "themuse": "The Muse",
+    "remotive": "Remotive", "remoteok": "RemoteOK", "usajobs": "USAJobs",
+}
 
 
-def run_crawl(term: str = "Summer 2027") -> list[dict]:
-    """Fetch every enabled source, add postings with new links, and return a per-source summary."""
-    with get_conn() as conn:
-        sources = conn.execute("SELECT * FROM crawl_sources WHERE enabled=1 ORDER BY id").fetchall()
-        known = {r[0] for r in conn.execute("SELECT link FROM postings WHERE link IS NOT NULL")}
-    summary = []
-    for src in sources:
-        row = dict(source=src["name"], found=0, added=0, error=None)
+def _job_key(company, title) -> tuple[str, str]:
+    norm = lambda t: re.sub(r"[^a-z0-9]+", " ", str(t or "").lower()).strip()
+    return norm(company), norm(title)
+
+
+def _fetch_sources(sources: list) -> list[tuple]:
+    """Fetch several sources at once. Returns (source row, items or None, error or None) in input order."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(src):
         try:
-            items = crawler.crawl_source(src["kind"], src["target"], src["name"], term)
-            row["found"] = len(items)
+            return src, crawler.crawl_source(src["kind"], src["target"], src["name"], src["term"] or "Summer 2027"), None
+        except crawler.CrawlError as e:
+            return src, None, str(e)
+        except Exception as e:  # keep one bad source from stopping the rest
+            return src, None, f"{type(e).__name__}: {e}"
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return list(pool.map(one, sources))
+
+
+def run_crawl(check_only: bool = False) -> list[dict]:
+    """Crawl enabled sources and add postings with new links; or, with check_only, test every source,
+    turn on the ones that work and turn off the ones that fail, without saving postings."""
+    with get_conn() as conn:
+        where = "" if check_only else "WHERE enabled=1"
+        sources = conn.execute(f"SELECT * FROM crawl_sources {where} ORDER BY id").fetchall()
+        known = {r[0] for r in conn.execute("SELECT link FROM postings WHERE link IS NOT NULL")}
+        # Different lists link the same job through different URLs, so also skip same company + title.
+        known_jobs = {_job_key(r[0], r[1]) for r in conn.execute("SELECT company, title FROM postings")}
+    summary = []
+    now = datetime.now().isoformat(timespec="minutes")
+    for src, items, error in _fetch_sources(sources):
+        row = dict(source=src["name"], found=len(items or []), added=0, error=error)
+        if items is not None and not check_only:
             with get_conn() as conn:
                 for item in items:
-                    if item["link"] in known:
+                    jk = _job_key(item["company"], item["title"])
+                    if not item.get("link") or item["link"] in known or jk in known_jobs:
                         continue
                     known.add(item["link"])
-                    item.update(source="Company careers page" if src["kind"] != "simplify"
-                                else "GitHub list (SimplifyJobs)",
+                    known_jobs.add(jk)
+                    item.update(source=POSTING_SOURCE_FOR_KIND.get(src["kind"], "Company careers page"),
                                 date_found=date.today(), origin=f"crawl:{src['name']}")
                     insert_posting(item, conn)
                     row["added"] += 1
-            status = f"OK: {row['found']} found, {row['added']} new"
-        except crawler.CrawlError as e:
-            row["error"] = str(e)
-            status = f"Failed: {e}"
-        except Exception as e:  # keep one bad source from stopping the rest
-            row["error"] = f"{type(e).__name__}: {e}"
-            status = f"Failed: {row['error']}"
+        if error:
+            status = f"Failed: {error}"
+        elif check_only:
+            status = f"Works: {row['found']} matching now"
+        else:
+            status = f"OK: {row['found']} matching, {row['added']} new"
         with get_conn() as conn:
-            conn.execute("UPDATE crawl_sources SET last_run=?, last_status=?, last_added=? WHERE id=?",
-                         (datetime.now().isoformat(timespec="minutes"), status, row["added"], src["id"]))
+            if check_only:
+                # Opt-in sources (such as off-season terms) are tested but not turned on automatically.
+                on = 0 if error else (src["enabled"] if src["preset"] in crawler.OPT_IN_PRESETS else 1)
+                conn.execute("UPDATE crawl_sources SET last_status=?, last_found=?, enabled=? WHERE id=?",
+                             (status, row["found"], on, src["id"]))
+            else:
+                conn.execute("UPDATE crawl_sources SET last_run=?, last_status=?, last_found=?, last_added=? "
+                             "WHERE id=?", (now, status, row["found"], row["added"], src["id"]))
         summary.append(row)
     return summary
 
@@ -578,28 +625,46 @@ def link_column_config() -> dict:
 
 def render_crawl_controls(key: str) -> None:
     with get_conn() as conn:
-        last = conn.execute("SELECT MAX(last_run) FROM crawl_sources WHERE enabled=1").fetchone()[0]
-        n_sources = conn.execute("SELECT COUNT(*) FROM crawl_sources WHERE enabled=1").fetchone()[0]
-    c1, c2 = st.columns([1, 3])
-    clicked = c1.button("Crawl and refresh", type="primary", key=f"crawl_{key}", disabled=not n_sources,
-                        help="Pulls new postings from the public feeds listed under Job postings > Crawl sources.")
-    c2.caption(
-        f"{n_sources} source(s) enabled. Last crawl: {last or 'never'}. Only public feeds are crawled "
-        "(the SimplifyJobs GitHub list, Greenhouse and Lever boards). Handshake, LinkedIn and Indeed need a "
-        "login or forbid crawling, so use **Job sites** and CSV import for those."
-    )
-    if clicked:
-        with st.spinner("Fetching postings..."):
-            summary = run_crawl()
-        added = sum(r["added"] for r in summary)
+        src = pd.read_sql_query("SELECT * FROM crawl_sources ORDER BY id", conn)
+    n_on = int(src["enabled"].sum()) if not src.empty else 0
+    last = src.loc[src["enabled"] == 1, "last_run"].dropna().max() if n_on else None
+    c1, c2, c3 = st.columns([1, 1, 3])
+    clicked = c1.button("Crawl and refresh", type="primary", key=f"crawl_{key}", disabled=not n_on,
+                        help="Pulls new postings from every website that is turned on in the list below.")
+    checked = c2.button("Check sources", key=f"check_{key}",
+                        help="Tests every website in the list, turns on the ones that respond and turns off the "
+                             "ones that fail. No postings are saved.")
+    c3.caption(f"{n_on} of {len(src)} websites turned on. Last crawl: {last if isinstance(last, str) else 'never'}.")
+
+    if clicked or checked:
+        with st.spinner("Checking websites..." if checked else "Fetching postings..."):
+            summary = run_crawl(check_only=checked)
         failed = [r for r in summary if r["error"]]
-        msg = f"Added {added} new posting(s) from {len(summary) - len(failed)} source(s)."
+        if checked:
+            msg = (f"{len(summary) - len(failed)} of {len(summary)} websites work. Working ones are turned on, "
+                   "except the off-season list, which stays your choice.")
+            if failed:
+                msg += f" {len(failed)} failed and were turned off (see Status)."
+        else:
+            added = sum(r["added"] for r in summary)
+            msg = f"Added {added} new posting(s) from {len(summary) - len(failed)} website(s)."
+            if failed:
+                msg += f" {len(failed)} could not be reached; the others were still updated."
         (st.warning if failed else st.success)(msg)
-        for r in summary:
-            if r["error"]:
-                st.caption(f"{r['source']}: could not refresh ({r['error']}). Other sources were still updated.")
-            else:
-                st.caption(f"{r['source']}: {r['found']} matching posting(s), {r['added']} new.")
+        with get_conn() as conn:
+            src = pd.read_sql_query("SELECT * FROM crawl_sources ORDER BY id", conn)
+
+    with st.expander(f"Websites crawled ({n_on} on)", expanded=True):
+        render_crawl_sources(src, key)
+    with st.expander(f"Websites not crawled ({len(crawler.NOT_CRAWLED)})", expanded=False):
+        st.caption("These sites need a login or forbid automated access, so search them yourself and add "
+                   "postings by hand or by CSV import.")
+        st.dataframe(
+            pd.DataFrame(crawler.NOT_CRAWLED, columns=["site", "link", "why"]), hide_index=True, width="stretch",
+            column_config={"site": st.column_config.TextColumn("Website"),
+                           "link": st.column_config.LinkColumn("Search", display_text="open search"),
+                           "why": st.column_config.TextColumn("Why it is not crawled")},
+        )
 
 
 def apply_next_frame() -> pd.DataFrame:
@@ -782,54 +847,75 @@ def page_dashboard() -> None:
         st.error(f"{len(overdue)} saved posting(s) passed their deadline without an application.")
 
 
-def render_crawl_sources() -> None:
-    st.caption(
-        "Public feeds that **Crawl and refresh** reads. For a company's own board, find its Greenhouse or Lever "
-        "name in the careers page address: job-boards.greenhouse.io/**name** or jobs.lever.co/**name**. "
-        "Only titles that mention intern, internship or co-op are kept."
-    )
-    with get_conn() as conn:
-        src = pd.read_sql_query("SELECT * FROM crawl_sources ORDER BY id", conn)
-    src["enabled"] = src["enabled"].astype(bool)
+def render_crawl_sources(src: pd.DataFrame, key: str) -> None:
+    st.caption("Tick **On** for the websites to crawl, then press **Save changes**. Only titles that mention "
+               "intern, internship or co-op are kept from job boards and company boards. Company boards that have "
+               "never been checked are off; press **Check sources** to test them.")
+    view = src.copy()
+    view["enabled"] = view["enabled"].astype(bool)
+    view["category"] = view["kind"].map(crawler.CATEGORY).fillna("Other")
+    view["type"] = view["kind"].map(crawler.KINDS).fillna(view["kind"])
+    order = {"GitHub lists": 0, "Job board APIs": 1, "Company boards": 2}
+    view = view.sort_values(["enabled", "category", "name"], ascending=[False, True, True],
+                            key=lambda col: col.map(order) if col.name == "category" else col)
     edited = st.data_editor(
-        src[["id", "enabled", "name", "kind", "target", "last_run", "last_status"]], hide_index=True,
-        width="stretch", key="sources_editor", disabled=["id", "kind", "last_run", "last_status"],
+        view[["id", "enabled", "name", "category", "type", "target", "last_run", "last_found", "last_added",
+              "last_status"]],
+        hide_index=True, width="stretch", height=320, key=f"sources_editor_{key}",
+        disabled=["id", "category", "type", "last_run", "last_found", "last_added", "last_status"],
         column_config={"id": None, "enabled": st.column_config.CheckboxColumn("On"),
-                       "kind": st.column_config.TextColumn("Type"),
-                       "target": st.column_config.TextColumn("Feed URL / board name")},
+                       "name": st.column_config.TextColumn("Website"),
+                       "category": st.column_config.TextColumn("Group"),
+                       "type": st.column_config.TextColumn("Type"),
+                       "target": st.column_config.TextColumn("Feed URL / board name"),
+                       "last_run": st.column_config.TextColumn("Last crawled"),
+                       "last_found": st.column_config.NumberColumn("Matching"),
+                       "last_added": st.column_config.NumberColumn("Added last time"),
+                       "last_status": st.column_config.TextColumn("Status")},
     )
-    c1, c2 = st.columns([1, 3])
-    if c1.button("Save sources"):
+    if st.button("Save changes", key=f"save_sources_{key}"):
         with get_conn() as conn:
             for r in edited.to_dict("records"):
                 conn.execute("UPDATE crawl_sources SET enabled=?, name=?, target=? WHERE id=?",
                              (int(bool(r["enabled"])), r["name"], r["target"], int(r["id"])))
         st.rerun()
-    with st.form("add_source", clear_on_submit=True):
+
+    st.markdown("**Add a website**")
+    st.caption("For a company's own board, take its name from the careers page address: "
+               "job-boards.greenhouse.io/**name**, jobs.lever.co/**name** or jobs.ashbyhq.com/**name**. "
+               "For another GitHub list, give the raw URL of its listings.json or README.md.")
+    with st.form(f"add_source_{key}", clear_on_submit=True):
         c1, c2, c3 = st.columns([1, 1, 2])
-        kind = c1.selectbox("Type", list(CRAWL_KINDS), format_func=CRAWL_KINDS.get)
+        kind = c1.selectbox("Type", ["greenhouse", "lever", "ashby", "simplify", "github_readme"],
+                            format_func=crawler.KINDS.get)
         name = c2.text_input("Company / label *")
-        target = c3.text_input("Board name or JSON URL *", placeholder="e.g. stripe")
-        if st.form_submit_button("Add source"):
+        target = c3.text_input("Board name or raw GitHub URL *", placeholder="e.g. stripe")
+        if st.form_submit_button("Add website"):
             if name.strip() and target.strip():
                 with get_conn() as conn:
-                    conn.execute("INSERT INTO crawl_sources (kind, name, target) VALUES (?, ?, ?)",
-                                 (kind, name.strip(), target.strip()))
+                    conn.execute("INSERT INTO crawl_sources (kind, name, target, term) VALUES (?, ?, ?, ?)",
+                                 (kind, name.strip(), target.strip(), "Summer 2027" if kind == "simplify" else ""))
                 st.rerun()
             else:
                 st.error("Label and board name are required.")
-    removable = {f"{r.name} ({r.kind})": int(r.id) for r in src.itertuples()}
-    gone = st.multiselect("Remove sources", list(removable), key="rm_sources")
-    if st.button("Remove selected sources", disabled=not gone):
-        delete_rows("crawl_sources", [removable[g] for g in gone])
+    removable = {f"{r.name} ({crawler.KINDS.get(r.kind, r.kind)})": int(r.id) for r in src.itertuples()}
+    gone = st.multiselect("Remove websites", list(removable), key=f"rm_sources_{key}")
+    if st.button("Remove selected", disabled=not gone, key=f"rm_btn_{key}"):
+        ids = [removable[g] for g in gone]
+        with get_conn() as conn:
+            presets = [r[0] for r in conn.execute(
+                f"SELECT preset FROM crawl_sources WHERE preset IS NOT NULL AND id IN ({','.join('?' * len(ids))})",
+                ids)]
+        if presets:
+            old = json.loads(get_profile("removed_presets") or "[]")
+            set_profile("removed_presets", json.dumps(sorted(set(old) | set(presets))))
+        delete_rows("crawl_sources", ids)
         st.rerun()
 
 
 def page_relevant_jobs() -> None:
     st.title("Job postings")
     render_crawl_controls("postings")
-    with st.expander("Crawl sources", expanded=False):
-        render_crawl_sources()
     st.caption(
         "Job postings you have collected, scored 0-100 against your resume: internship, target role "
         "(SWE, bioinformatics, research, data), Summer 2027, open to sophomores, and resume skills. "
