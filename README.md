@@ -49,6 +49,8 @@ To add a dependency, run `uv add <package>` (this updates `pyproject.toml` and `
 - **Contacts**: recruiters, alumni, professors, with follow-up dates.
 - **Job sites**: one-click searches (LinkedIn, Indeed, Handshake, Wellfound, Google Jobs) with presets for
   SWE, bioinformatics, research and sophomore programs, plus a list of recommended sites.
+- **Tailor resume**: make a version of your resume for one job. Open it with the **Tailor resume** button on
+  Apply next, Job postings or Applications. See "Tailoring your resume" below.
 - **Resume keyword match**: paste a job description to see which of your skills it mentions and what it asks
   for that is not on your resume.
 - **Import / export**: import applications (try `sample_import.csv`) or job postings (try
@@ -73,6 +75,35 @@ Handshake, LinkedIn, Indeed and similar sites need a login or forbid automated a
 app does not crawl them. Use the saved searches on **Job sites**, and add postings from those sites by hand or
 by CSV import.
 
+## Tailoring your resume
+
+1. On the **Tailor resume** page, open **Your resume** and load it: put your resume PDF in a `resume/` folder
+   next to `app.py` and press **Load it**, or upload the file. Check the text it pulled out and fix anything,
+   then press **Save resume text**. This is done once.
+2. Pick a job and paste its full job description. Crawled jobs only have a title, so open the posting and copy
+   the description in. It is saved with the posting, and the posting's relevance score is updated.
+3. Choose a method and press **Tailor my resume**:
+   - **AI (Claude)** rewrites emphasis and wording for the job. It may reorder, rephrase and trim, but it is
+     told never to add experience, skills, tools, numbers or dates that are not on your resume. If the result
+     mentions a technology your original resume does not, the app warns you. Your resume and the job
+     description are sent to the Anthropic API.
+   - **Keyword only (no AI)** works offline. It moves the bullets, entries and skills that match the job to
+     the top, and lists job keywords your resume does not mention yet.
+4. Read the result and the list of changes, edit it, then **Save this version** (kept per job) and download it
+   as .docx, PDF or Markdown.
+
+To use AI mode, create a file named `.env` next to `app.py` with your Anthropic API key:
+
+```
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+`.env` is in `.gitignore`, so the key is never committed. The default model is `claude-opus-5-5`. You can pick
+`claude-sonnet-5-5` or `claude-haiku-5-5` on the page for a cheaper run.
+
+Your resume file (`resume/`) and the database that stores your resume text and tailored versions (`data/`)
+are both in `.gitignore`.
+
 ## Database
 
 Everything lives in one SQLite file, `data/jobsearch.db`, created on first run. Tables:
@@ -84,6 +115,9 @@ Everything lives in one SQLite file, `data/jobsearch.db`, created on first run. 
   score, a status (New, Saved, Dismissed, Added to applications), where it came from (`origin`) and a link to
   the application made from it.
 - `crawl_sources`: the feeds that Crawl and refresh reads, with the result of the last run.
+- `profile`: your resume text, used for tailoring.
+- `tailored_resumes`: each saved tailored version, with the job description, method, list of changes and
+  missing keywords, linked to its posting or application.
 
 You can open it with any SQLite tool, for example `sqlite3 data/jobsearch.db`.
 

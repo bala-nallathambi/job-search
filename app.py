@@ -6,6 +6,7 @@ All data stays on your machine in data/jobsearch.db (SQLite).
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import urllib.parse
@@ -16,6 +17,7 @@ import pandas as pd
 import streamlit as st
 
 import crawler
+import tailor
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -174,6 +176,29 @@ def init_db() -> None:
                 last_status TEXT,
                 last_added INTEGER
             );
+            -- Small key/value store, e.g. your resume text (stays in this local file).
+            CREATE TABLE IF NOT EXISTS profile (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            -- Resume versions tailored to one job.
+            CREATE TABLE IF NOT EXISTS tailored_resumes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                posting_id INTEGER REFERENCES postings(id) ON DELETE SET NULL,
+                application_id INTEGER REFERENCES applications(id) ON DELETE SET NULL,
+                company TEXT,
+                title TEXT,
+                job_description TEXT,
+                method TEXT,                   -- ai | keyword
+                model TEXT,
+                resume_markdown TEXT,
+                changes TEXT,                  -- JSON list
+                missing_keywords TEXT,         -- JSON list
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_tailored_posting ON tailored_resumes(posting_id);
+            CREATE INDEX IF NOT EXISTS idx_tailored_app ON tailored_resumes(application_id);
             """
         )
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(postings)")}
@@ -477,6 +502,24 @@ def posting_to_application(posting_id: int, status: str = "Interested") -> int |
     return app_id
 
 
+def get_profile(key: str) -> str | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT value FROM profile WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_profile(key: str, value: str) -> None:
+    with get_conn() as conn:
+        conn.execute("INSERT INTO profile (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET "
+                     "value=excluded.value, updated_at=CURRENT_TIMESTAMP", (key, value))
+
+
+def go_tailor(target: str) -> None:
+    """Button callback: open the Tailor resume page for a posting ('p<id>') or application ('a<id>')."""
+    st.session_state["tailor_target"] = target
+    st.session_state["nav"] = "Tailor resume"
+
+
 def mark_applied(app_ids: list[int]) -> None:
     with get_conn() as conn:
         for aid in app_ids:
@@ -492,6 +535,12 @@ def days_until(d) -> int | None:
     if d is None or pd.isna(d):
         return None
     return (d - date.today()).days
+
+
+def days_left_series(dates: pd.Series) -> pd.Series:
+    """Days until each date as floats (NaN when missing); safe on empty frames."""
+    return pd.to_numeric(dates.apply(days_until), errors="coerce").astype("float") if len(dates) else \
+        pd.Series(dtype="float", index=dates.index)
 
 
 def search_links(query: str, location: str = "") -> dict[str, str]:
@@ -571,7 +620,7 @@ def apply_next_frame() -> pd.DataFrame:
                          why=r["notes"], link=r["link"]))
     df = pd.DataFrame(rows, columns=["key", "kind", "company", "role", "relevance", "location", "posted",
                                      "deadline", "why", "link"])
-    df["days_left"] = df["deadline"].apply(days_until)
+    df["days_left"] = days_left_series(df["deadline"])
     return df[df["days_left"].isna() | (df["days_left"] >= 0)]
 
 
@@ -635,7 +684,7 @@ def render_apply_next() -> None:
     keys = list(picked.loc[picked["select"], "key"])
     post_ids = [int(k[1:]) for k in keys if k.startswith("p")]
     app_ids = [int(k[1:]) for k in keys if k.startswith("a")]
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     if c1.button(f"Mark {len(keys)} applied", type="primary", disabled=not keys):
         for pid in post_ids:
             posting_to_application(pid, status="Applied")
@@ -650,6 +699,8 @@ def render_apply_next() -> None:
     if c3.button("Dismiss", disabled=not post_ids, help="Hides the picked postings. Tracked jobs are not affected."):
         set_posting_status(post_ids, "Dismissed")
         st.rerun()
+    c4.button("Tailor resume", disabled=len(keys) != 1, on_click=go_tailor, args=(keys[0] if keys else "",),
+              key="tailor_apply_next", help="Pick one job to make a version of your resume for it.")
 
 
 def page_dashboard() -> None:
@@ -691,7 +742,7 @@ def page_dashboard() -> None:
 
     st.subheader("Deadlines in the next 21 days")
     upcoming = df[df["status"].isin(["Interested"]) | df["status"].isin(ACTIVE_STATUSES)].copy()
-    upcoming["days_left"] = upcoming["deadline"].apply(days_until)
+    upcoming["days_left"] = days_left_series(upcoming["deadline"])
     upcoming = upcoming[upcoming["days_left"].notna() & (upcoming["days_left"] >= 0) & (upcoming["days_left"] <= 21)]
     if upcoming.empty:
         st.caption("Nothing due in the next three weeks.")
@@ -705,7 +756,7 @@ def page_dashboard() -> None:
 
     st.subheader("Follow-ups and next actions")
     todo = df[df["next_action_date"].notna() & df["status"].isin(ACTIVE_STATUSES)].copy()
-    todo["days_left"] = todo["next_action_date"].apply(days_until)
+    todo["days_left"] = days_left_series(todo["next_action_date"])
     todo = todo[todo["days_left"] <= 7]
     stale = df[(df["status"] == "Applied") & df["date_applied"].apply(
         lambda d: d is not None and not pd.isna(d) and (today - d).days >= 21)]
@@ -725,7 +776,7 @@ def page_dashboard() -> None:
                      hide_index=True, width="stretch")
 
     overdue = df[df["status"] == "Interested"].copy()
-    overdue["days_left"] = overdue["deadline"].apply(days_until)
+    overdue["days_left"] = days_left_series(overdue["deadline"])
     overdue = overdue[overdue["days_left"].notna() & (overdue["days_left"] < 0)]
     if not overdue.empty:
         st.error(f"{len(overdue)} saved posting(s) passed their deadline without an application.")
@@ -831,7 +882,7 @@ def page_relevant_jobs() -> None:
         view = view[view["status"].isin(status_f)]
     if source_f:
         view = view[view["source"].isin(source_f)]
-    view["days_left"] = view["deadline"].apply(days_until)
+    view["days_left"] = days_left_series(view["deadline"])
     if hide_past:
         view = view[view["days_left"].isna() | (view["days_left"] >= 0)]
     if within != "Any":
@@ -890,6 +941,8 @@ def page_relevant_jobs() -> None:
     if c4.button("Delete", disabled=not ids):
         delete_rows("postings", ids)
         st.rerun()
+    st.button("Tailor resume for the picked posting", disabled=len(ids) != 1, on_click=go_tailor,
+              args=(f"p{ids[0]}" if ids else "",), key="tailor_postings")
 
     with st.expander("Rescore"):
         st.caption("Scores are saved when a posting is added. Rescore after editing RESUME_SKILLS or the "
@@ -1013,6 +1066,12 @@ def page_applications() -> None:
                 changed += 1
         st.success(f"Updated {changed} row(s).")
         st.rerun()
+
+    tailor_labels = {f"#{r.id} {r.company} - {r.role}": f"a{int(r.id)}" for r in view.itertuples()}
+    c1, c2 = st.columns([3, 1])
+    tailor_pick = c1.selectbox("Tailor your resume for", list(tailor_labels), key="tailor_app_pick")
+    c2.button("Tailor resume", on_click=go_tailor, args=(tailor_labels.get(tailor_pick, ""),),
+              disabled=not tailor_pick, key="tailor_app_btn")
 
     with st.expander("Delete applications"):
         labels = {f"#{r.id} {r.company} - {r.role}": int(r.id) for r in view.itertuples()}
@@ -1182,6 +1241,183 @@ def page_keyword_match() -> None:
         st.caption("Only list a skill on your resume if you can talk about it in an interview.")
 
 
+def _tailor_jobs() -> dict[str, dict]:
+    """Jobs to choose from on the Tailor page, keyed like 'p12' / 'a3'."""
+    target = st.session_state.get("tailor_target", "")
+    with get_conn() as conn:
+        posts = conn.execute(
+            "SELECT * FROM postings WHERE status != 'Dismissed' AND (status != 'New' OR relevance >= 45 OR id = ?) "
+            "ORDER BY relevance DESC LIMIT 300",
+            (int(target[1:]) if target.startswith("p") and target[1:].isdigit() else -1,)).fetchall()
+        apps = conn.execute("SELECT * FROM applications ORDER BY id DESC").fetchall()
+        linked = {r["application_id"]: r for r in conn.execute(
+            "SELECT application_id, id, description FROM postings WHERE application_id IS NOT NULL")}
+    jobs: dict[str, dict] = {}
+    for a in apps:
+        post = linked.get(a["id"])
+        jobs[f"a{a['id']}"] = dict(label=f"Application: {a['company']} - {a['role']} ({a['status']})",
+                                   company=a["company"], title=a["role"], link=a["link"],
+                                   description=(post["description"] if post else None) or "",
+                                   posting_id=post["id"] if post else None, application_id=a["id"])
+    for p in posts:
+        if p["application_id"]:
+            continue
+        jobs[f"p{p['id']}"] = dict(label=f"Posting: {p['company']} - {p['title']} (relevance {p['relevance']})",
+                                   company=p["company"], title=p["title"], link=p["link"],
+                                   description=p["description"] or "", posting_id=p["id"], application_id=None)
+    return jobs
+
+
+def _saved_versions(job: dict) -> pd.DataFrame:
+    with get_conn() as conn:
+        return pd.read_sql_query(
+            "SELECT * FROM tailored_resumes WHERE (posting_id IS NOT NULL AND posting_id = ?) "
+            "OR (application_id IS NOT NULL AND application_id = ?) ORDER BY id DESC",
+            conn, params=(job["posting_id"] or -1, job["application_id"] or -1))
+
+
+def page_tailor() -> None:
+    st.title("Tailor resume")
+    st.caption("Make a version of your resume for one job. Facts stay the same: only order, emphasis and "
+               "wording change. Always read the result before you send it.")
+
+    # ---- your resume
+    resume_md = get_profile("resume_markdown")
+    with st.expander("Your resume", expanded=not resume_md):
+        local = tailor.find_local_resume(APP_DIR / "resume")
+        c1, c2 = st.columns(2)
+        up = c1.file_uploader("Upload your resume (PDF, DOCX or TXT)", type=["pdf", "docx", "txt", "md"])
+        if up is not None and c1.button("Use this file"):
+            md = tailor.resume_to_markdown(tailor.extract_resume_text(up.getvalue(), up.name))
+            set_profile("resume_markdown", md)
+            set_profile("resume_source", up.name)
+            st.rerun()
+        if local is not None:
+            c2.caption(f"Found `{local.relative_to(APP_DIR)}` in the app folder.")
+            if c2.button("Load it"):
+                md = tailor.resume_to_markdown(tailor.extract_resume_text(local.read_bytes(), local.name))
+                set_profile("resume_markdown", md)
+                set_profile("resume_source", local.name)
+                st.rerun()
+        if resume_md:
+            st.caption(f"Loaded from {get_profile('resume_source') or 'text'}. Check that headings (##), "
+                       "entries (###) and bullets (-) came through right, and fix anything here.")
+            edited = st.text_area("Resume text (Markdown)", resume_md, height=350, key="resume_text_edit")
+            if st.button("Save resume text"):
+                set_profile("resume_markdown", edited)
+                st.success("Saved.")
+                st.rerun()
+        st.caption("Your resume is kept in `data/jobsearch.db` on this computer and is never committed to git.")
+    if not resume_md:
+        st.info("Load your resume above to start.")
+        return
+
+    # ---- job
+    jobs = _tailor_jobs()
+    if not jobs:
+        st.info("No jobs yet. Add postings or applications first.")
+        return
+    keys = list(jobs)
+    target = st.session_state.get("tailor_target")
+    idx = keys.index(target) if target in keys else 0
+    key = st.selectbox("Job", keys, index=idx, format_func=lambda k: jobs[k]["label"])
+    st.session_state["tailor_target"] = key
+    job = jobs[key]
+    if job["link"]:
+        st.link_button("Open the posting", job["link"])
+
+    versions = _saved_versions(job)
+    default_jd = job["description"] or (versions.iloc[0]["job_description"] if not versions.empty else "") or ""
+    jd = st.text_area("Job description", default_jd, height=220, key=f"jd_{key}",
+                      help="Paste the full description from the posting. The more detail, the better the result.")
+    if len(jd.strip()) < 300:
+        st.warning("This job has little or no description (crawled jobs only have a title). Open the posting, "
+                   "copy the full description, and paste it above for a useful result.")
+
+    has_key = tailor.api_key_available()
+    c1, c2 = st.columns([2, 1])
+    method = c1.radio("Method", ["AI (Claude)", "Keyword only (no AI)"], index=0 if has_key else 1,
+                      horizontal=True, key="tailor_method")
+    model = c2.selectbox("Model", tailor.MODEL_CHOICES, key="tailor_model",
+                         disabled=method != "AI (Claude)")
+    if method == "AI (Claude)":
+        if has_key:
+            st.caption("Your resume and this job description are sent to the Anthropic API to write the new "
+                       "version.")
+        else:
+            st.warning("No ANTHROPIC_API_KEY found. Add it to a `.env` file in the app folder (see README), "
+                       "or use Keyword only.")
+
+    use_ai = method == "AI (Claude)"
+    if st.button("Tailor my resume", type="primary", disabled=(use_ai and not has_key) or not jd.strip()):
+        try:
+            with st.spinner("Tailoring..."):
+                if use_ai:
+                    result = tailor.ai_tailor(resume_md, job["company"], job["title"], jd, model)
+                else:
+                    result = tailor.keyword_tailor(resume_md, job["title"], jd)
+        except tailor.TailorError as e:
+            st.error(str(e))
+            result = None
+        if result:
+            if job["posting_id"] and jd.strip() != (job["description"] or "").strip():
+                with get_conn() as conn:
+                    row = dict(conn.execute("SELECT * FROM postings WHERE id=?", (job["posting_id"],)).fetchone())
+                row["description"] = jd
+                update_posting(job["posting_id"], row)  # also refreshes its relevance score
+            st.session_state["tailor_result"] = dict(result, job_key=key, job_description=jd)
+
+    result = st.session_state.get("tailor_result")
+    if result and result.get("job_key") == key:
+        st.subheader("Result")
+        st.caption("Made with " + (f"Claude ({result['model']})" if result["method"] == "ai" else "keyword matching")
+                   + ". Edit anything below, then save or download.")
+        for w in result.get("warnings") or []:
+            st.warning(w)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**What changed**")
+            st.markdown("\n".join(f"- {c}" for c in result["changes"]) or "Nothing.")
+        with c2:
+            st.markdown("**Job keywords your resume already covers**")
+            st.write(", ".join(result["keywords_used"]) or "None found")
+            st.markdown("**Asked for, not on your resume**")
+            st.write(", ".join(result["missing_keywords"]) or "None")
+            st.caption("Add one of these only if it is true and you can talk about it in an interview.")
+        final = st.text_area("Tailored resume (Markdown)", result["resume_markdown"], height=450,
+                             key=f"tailored_{key}_{id(result)}")
+        safe = re.sub(r"[^A-Za-z0-9]+", "_", f"Resume_{job['company']}_{job['title']}")[:60].strip("_")
+        c1, c2, c3, c4 = st.columns(4)
+        if c1.button("Save this version", type="primary"):
+            with get_conn() as conn:
+                conn.execute(
+                    "INSERT INTO tailored_resumes (posting_id, application_id, company, title, job_description, "
+                    "method, model, resume_markdown, changes, missing_keywords) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (job["posting_id"], job["application_id"], job["company"], job["title"],
+                     result["job_description"], result["method"], result["model"], final,
+                     json.dumps(result["changes"]), json.dumps(result["missing_keywords"])))
+            st.success("Saved. It is listed under Saved versions below.")
+        c2.download_button("Download .docx", tailor.to_docx(final), f"{safe}.docx",
+                           "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        c3.download_button("Download PDF", tailor.to_pdf(final), f"{safe}.pdf", "application/pdf")
+        c4.download_button("Download .md", final, f"{safe}.md", "text/markdown")
+
+    versions = _saved_versions(job)
+    if not versions.empty:
+        st.subheader("Saved versions for this job")
+        for v in versions.itertuples():
+            with st.expander(f"{v.created_at} · {'Claude ' + (v.model or '') if v.method == 'ai' else 'keyword'}"):
+                st.markdown(v.resume_markdown)
+                safe = re.sub(r"[^A-Za-z0-9]+", "_", f"Resume_{v.company}_{v.title}")[:60].strip("_")
+                c1, c2, c3 = st.columns(3)
+                c1.download_button("Download .docx", tailor.to_docx(v.resume_markdown), f"{safe}.docx",
+                                   key=f"vd_{v.id}")
+                c2.download_button("Download PDF", tailor.to_pdf(v.resume_markdown), f"{safe}.pdf", key=f"vp_{v.id}")
+                if c3.button("Delete version", key=f"vx_{v.id}"):
+                    delete_rows("tailored_resumes", [int(v.id)])
+                    st.rerun()
+
+
 def page_import_export() -> None:
     st.title("Import / export")
     st.subheader("Export")
@@ -1320,6 +1556,7 @@ def page_import_export() -> None:
 
 def main() -> None:
     st.set_page_config(page_title="Internship Tracker 2027", page_icon=":briefcase:", layout="wide")
+    tailor.load_dotenv(APP_DIR)
     init_db()
     pages = {
         "Dashboard": page_dashboard,
@@ -1328,13 +1565,14 @@ def main() -> None:
         "Applications": page_applications,
         "Contacts": page_contacts,
         "Job sites": page_sites,
+        "Tailor resume": page_tailor,
         "Resume keyword match": page_keyword_match,
         "Import / export": page_import_export,
     }
     with st.sidebar:
         st.header("Internship Tracker")
         st.caption("Summer 2027 · CS & Biology")
-        choice = st.radio("Go to", list(pages), label_visibility="collapsed")
+        choice = st.radio("Go to", list(pages), label_visibility="collapsed", key="nav")
         st.divider()
         st.link_button("Handshake", "https://app.joinhandshake.com/stu/postings", width="stretch")
         st.link_button("Internships.com", "https://www.internships.com/", width="stretch")
