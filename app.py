@@ -85,6 +85,7 @@ def get_conn() -> sqlite3.Connection:
     DATA_DIR.mkdir(exist_ok=True)
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
@@ -132,6 +133,33 @@ def init_db() -> None:
                 status TEXT,
                 changed_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
+            -- Job postings you have found but not necessarily applied to yet.
+            CREATE TABLE IF NOT EXISTS postings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company TEXT NOT NULL,
+                title TEXT NOT NULL,
+                location TEXT,
+                source TEXT,
+                link TEXT,
+                description TEXT,
+                date_posted TEXT,
+                date_found TEXT,
+                deadline TEXT,
+                pay TEXT,
+                relevance INTEGER DEFAULT 0,
+                matched_skills TEXT,
+                reasons TEXT,
+                status TEXT DEFAULT 'New',
+                application_id INTEGER REFERENCES applications(id) ON DELETE SET NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_postings_relevance ON postings(relevance DESC);
+            CREATE INDEX IF NOT EXISTS idx_postings_status ON postings(status);
+            CREATE INDEX IF NOT EXISTS idx_postings_deadline ON postings(deadline);
+            CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status);
+            CREATE INDEX IF NOT EXISTS idx_applications_deadline ON applications(deadline);
+            CREATE INDEX IF NOT EXISTS idx_status_history_app ON status_history(app_id);
             """
         )
 
@@ -145,8 +173,13 @@ CONTACT_COLUMNS = [
     "name", "company", "title", "email", "linkedin", "how_met",
     "last_contacted", "follow_up_date", "notes",
 ]
+POSTING_COLUMNS = [
+    "company", "title", "location", "source", "link", "description",
+    "date_posted", "date_found", "deadline", "pay",
+]
+POSTING_STATUSES = ["New", "Saved", "Dismissed", "Added to applications"]
 DATE_COLUMNS = ["date_found", "date_applied", "deadline", "next_action_date",
-                "last_contacted", "follow_up_date"]
+                "last_contacted", "follow_up_date", "date_posted"]
 
 
 def _clean(value):
@@ -229,6 +262,154 @@ def update_contact(contact_id: int, record: dict) -> None:
             f"UPDATE contacts SET {sets} WHERE id=?",
             [_clean(record.get(c)) for c in CONTACT_COLUMNS] + [contact_id],
         )
+
+
+# ---------------------------------------------------------------- job postings + relevance
+
+
+# Terms that make a posting a fit for a CS + Biology sophomore targeting Summer 2027.
+TARGET_ROLE_TERMS = {
+    "software": 15, "developer": 12, "engineering": 8, "bioinformatics": 20,
+    "computational biology": 20, "comp bio": 15, "genomics": 12, "research": 10,
+    "reu": 15, "data": 8, "machine learning": 8, "web": 6, "frontend": 8, "full stack": 8,
+}
+EARLY_CAREER_TERMS = [
+    "sophomore", "freshman", "first-year", "first year", "second-year", "second year",
+    "underclassmen", "early insight", "discovery program", "explore", "step intern",
+    "class of 2029", "rising sophomore", "rising junior",
+]
+MISMATCH_TERMS = {
+    "senior": 25, "staff engineer": 25, "phd": 20, "ph.d": 20, "master's": 15, "masters": 15,
+    "graduate student": 15, "new grad": 20, "full-time": 15, "full time": 15,
+    "5+ years": 25, "3+ years": 20, "class of 2026": 20, "class of 2027": 10,
+}
+
+
+def _mentions(text: str, term: str) -> bool:
+    t = term.lower()
+    if len(t) <= 4:
+        return re.search(rf"(?<![a-z]){re.escape(t)}(?![a-z+#])", text) is not None
+    return t in text
+
+
+def score_posting(title: str | None, description: str | None, deadline=None,
+                  skills: list[str] | None = None) -> tuple[int, list[str], list[str]]:
+    """Return (score 0-100, matched resume skills, reasons)."""
+    skills = skills or RESUME_SKILLS
+    title_l = (title or "").lower()
+    text = f"{title_l}\n{(description or '').lower()}"
+    score, reasons = 0, []
+
+    if _mentions(title_l, "intern") or "internship" in text or "co-op" in text:
+        score += 15
+        reasons.append("internship")
+    role_pts = 0
+    for term, pts in TARGET_ROLE_TERMS.items():
+        if _mentions(title_l, term):
+            role_pts += pts
+        elif _mentions(text, term):
+            role_pts += pts // 3
+    if role_pts:
+        score += min(role_pts, 25)
+        reasons.append("target role")
+    if "2027" in text:
+        score += 15
+        reasons.append("Summer 2027")
+    if any(_mentions(text, t) for t in EARLY_CAREER_TERMS):
+        score += 15
+        reasons.append("open to sophomores")
+
+    matched = [s for s in skills if _mentions(text, s)]
+    if matched:
+        score += min(len(matched) * 5, 30)
+        reasons.append(f"{len(matched)} resume skill(s)")
+
+    penalty = 0
+    for term, pts in MISMATCH_TERMS.items():
+        if _mentions(text, term):
+            penalty += pts
+            reasons.append(f"mentions '{term}'")
+    score -= min(penalty, 50)
+
+    d = deadline
+    if isinstance(d, str):
+        d = pd.to_datetime(d, errors="coerce")
+        d = None if pd.isna(d) else d.date()
+    if d is not None and not pd.isna(d) and d < date.today():
+        score -= 30
+        reasons.append("deadline passed")
+
+    return max(0, min(100, score)), matched, reasons
+
+
+def _posting_values(record: dict) -> tuple[list, int, str, str]:
+    values = [_clean(record.get(c)) for c in POSTING_COLUMNS]
+    rec = dict(zip(POSTING_COLUMNS, values))
+    score, matched, reasons = score_posting(rec["title"], rec["description"], rec["deadline"])
+    return values, score, ", ".join(matched), "; ".join(reasons)
+
+
+def insert_posting(record: dict) -> int:
+    values, score, matched, reasons = _posting_values(record)
+    with get_conn() as conn:
+        cur = conn.execute(
+            f"INSERT INTO postings ({', '.join(POSTING_COLUMNS)}, relevance, matched_skills, reasons, status) "
+            f"VALUES ({', '.join('?' * (len(POSTING_COLUMNS) + 4))})",
+            values + [score, matched, reasons, _clean(record.get("status")) or "New"],
+        )
+        return cur.lastrowid
+
+
+def update_posting(posting_id: int, record: dict) -> None:
+    values, score, matched, reasons = _posting_values(record)
+    sets = ", ".join(f"{c}=?" for c in POSTING_COLUMNS)
+    with get_conn() as conn:
+        conn.execute(
+            f"UPDATE postings SET {sets}, relevance=?, matched_skills=?, reasons=?, status=?, "
+            "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            values + [score, matched, reasons, _clean(record.get("status")) or "New", posting_id],
+        )
+
+
+def set_posting_status(ids: list[int], status: str) -> None:
+    with get_conn() as conn:
+        conn.executemany("UPDATE postings SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                         [(status, i) for i in ids])
+
+
+def rescore_all_postings() -> int:
+    df = load_df("postings")
+    for rec in df.to_dict("records"):
+        update_posting(int(rec["id"]), rec)
+    return len(df)
+
+
+def posting_to_application(posting_id: int) -> int | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM postings WHERE id=?", (posting_id,)).fetchone()
+    if row is None:
+        return None
+    if row["application_id"]:
+        return row["application_id"]
+    text = f"{row['title']} {row['description'] or ''}".lower()
+    track = next((t for k, t in [
+        ("bioinformatics", "Bioinformatics / Comp Bio"), ("computational biology", "Bioinformatics / Comp Bio"),
+        ("reu", "Research (REU / lab)"), ("research", "Research (REU / lab)"),
+        ("sophomore", "Sophomore program (Explore/STEP-style)"), ("data", "Data / ML"),
+        ("machine learning", "Data / ML"), ("frontend", "Web / Frontend"), ("web", "Web / Frontend"),
+        ("software", "Software Engineering"),
+    ] if _mentions(text, k)), "Other")
+    app_id = insert_application(dict(
+        company=row["company"], role=row["title"], track=track, location=row["location"],
+        source=row["source"], link=row["link"], status="Interested",
+        priority="High" if (row["relevance"] or 0) >= 70 else "Medium",
+        date_found=row["date_found"] or date.today(), deadline=row["deadline"], pay=row["pay"],
+        notes=f"From job postings (relevance {row['relevance']}). {row['reasons'] or ''}".strip(),
+    ))
+    with get_conn() as conn:
+        conn.execute("UPDATE postings SET status='Added to applications', application_id=?, "
+                     "updated_at=CURRENT_TIMESTAMP WHERE id=?", (app_id, posting_id))
+    return app_id
 
 
 # ---------------------------------------------------------------- helpers
@@ -345,6 +526,125 @@ def page_dashboard() -> None:
     overdue = overdue[overdue["days_left"].notna() & (overdue["days_left"] < 0)]
     if not overdue.empty:
         st.error(f"{len(overdue)} saved posting(s) passed their deadline without an application.")
+
+
+def page_relevant_jobs() -> None:
+    st.title("Relevant jobs")
+    st.caption(
+        "Job postings you have collected, scored 0-100 against your resume: internship, target role "
+        "(SWE, bioinformatics, research, data), Summer 2027, open to sophomores, and resume skills. "
+        "Senior, PhD, new-grad or expired postings are scored down."
+    )
+
+    with st.expander("Add a posting", expanded=False):
+        with st.form("posting_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            company = c1.text_input("Company *")
+            title = c2.text_input("Job title *")
+            c1, c2, c3 = st.columns(3)
+            source = c1.selectbox("Source site", SOURCES)
+            location = c2.text_input("Location")
+            pay = c3.text_input("Pay (if listed)")
+            link = st.text_input("Posting link")
+            c1, c2 = st.columns(2)
+            date_posted = c1.date_input("Date posted", None)
+            deadline = c2.date_input("Deadline", None)
+            description = st.text_area("Job description (paste it for a better score)", height=150)
+            if st.form_submit_button("Save posting", type="primary"):
+                if company.strip() and title.strip():
+                    pid = insert_posting(dict(company=company, title=title, source=source, location=location,
+                                              pay=pay, link=link, date_posted=date_posted, deadline=deadline,
+                                              description=description, date_found=date.today()))
+                    with get_conn() as conn:
+                        score = conn.execute("SELECT relevance FROM postings WHERE id=?", (pid,)).fetchone()[0]
+                    st.success(f"Saved {company} - {title} (relevance {score}).")
+                else:
+                    st.error("Company and job title are required.")
+
+    df = load_df("postings")
+    if df.empty:
+        st.info("No postings yet. Add one above, or import a CSV of postings from **Import / export** "
+                "(try `sample_postings.csv`).")
+        return
+
+    with st.expander("Filters", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        min_score = c1.slider("Minimum relevance", 0, 100, 40, step=5)
+        status_f = c2.multiselect("Status", POSTING_STATUSES, default=["New", "Saved"])
+        source_f = c3.multiselect("Source", sorted(df["source"].dropna().unique()))
+        within = c4.selectbox("Deadline", ["Any", "Next 7 days", "Next 14 days", "Next 30 days", "Next 90 days"])
+        c1, c2 = st.columns([3, 1])
+        text_f = c1.text_input("Search company / title / description")
+        hide_past = c2.checkbox("Hide past deadlines", value=True)
+
+    view = df[df["relevance"].fillna(0) >= min_score].copy()
+    if status_f:
+        view = view[view["status"].isin(status_f)]
+    if source_f:
+        view = view[view["source"].isin(source_f)]
+    view["days_left"] = view["deadline"].apply(days_until)
+    if hide_past:
+        view = view[view["days_left"].isna() | (view["days_left"] >= 0)]
+    if within != "Any":
+        n = int(within.split()[1])
+        view = view[view["days_left"].notna() & (view["days_left"] <= n)]
+    if text_f:
+        mask = pd.Series(False, index=view.index)
+        for col in ("company", "title", "description"):
+            mask |= view[col].fillna("").str.contains(text_f, case=False, regex=False)
+        view = view[mask]
+    view = view.sort_values(["relevance", "deadline"], ascending=[False, True], na_position="last")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Relevant postings", len(view))
+    c2.metric("Strong match (70+)", int((view["relevance"] >= 70).sum()))
+    c3.metric("Due in 14 days", int((view["days_left"].notna() & (view["days_left"] <= 14)).sum()))
+    c4.metric("All postings", len(df))
+
+    if view.empty:
+        st.caption("No postings match these filters. Try lowering the minimum relevance.")
+        return
+
+    view.insert(0, "select", False)
+    shown = ["select", "id", "relevance", "company", "title", "location", "source", "deadline",
+             "days_left", "matched_skills", "reasons", "status", "link"]
+    picked = st.data_editor(
+        view[shown], hide_index=True, width="stretch", key="postings_editor",
+        disabled=[c for c in shown if c != "select"],
+        column_config={
+            "select": st.column_config.CheckboxColumn("Pick"),
+            "id": st.column_config.NumberColumn("ID"),
+            "relevance": st.column_config.ProgressColumn("Relevance", min_value=0, max_value=100, format="%d"),
+            "deadline": st.column_config.DateColumn("Deadline"),
+            "days_left": st.column_config.NumberColumn("Days left"),
+            "matched_skills": st.column_config.TextColumn("Your skills"),
+            "reasons": st.column_config.TextColumn("Why"),
+            "link": st.column_config.LinkColumn("Link", display_text="open"),
+        },
+    )
+    ids = [int(i) for i in picked.loc[picked["select"], "id"]]
+    c1, c2, c3, c4 = st.columns(4)
+    if c1.button(f"Add {len(ids)} to Applications", type="primary", disabled=not ids):
+        for pid in ids:
+            posting_to_application(pid)
+        st.success(f"Added {len(ids)} posting(s) to Applications as Interested.")
+        st.rerun()
+    if c2.button("Mark saved", disabled=not ids):
+        set_posting_status(ids, "Saved")
+        st.rerun()
+    if c3.button("Dismiss", disabled=not ids):
+        set_posting_status(ids, "Dismissed")
+        st.rerun()
+    if c4.button("Delete", disabled=not ids):
+        delete_rows("postings", ids)
+        st.rerun()
+
+    with st.expander("Rescore"):
+        st.caption("Scores are saved when a posting is added. Rescore after editing RESUME_SKILLS or the "
+                   "scoring terms at the top of app.py, or as deadlines pass.")
+        if st.button("Rescore all postings"):
+            st.success(f"Rescored {rescore_all_postings()} posting(s).")
+            st.rerun()
 
 
 def application_form(defaults: dict | None = None, key: str = "new") -> dict | None:
@@ -697,6 +997,68 @@ def page_import_export() -> None:
                 added += 1
             st.success(f"Imported {added} application(s).")
 
+    st.subheader("Import job postings from CSV")
+    st.caption(
+        "Postings go to **Relevant jobs**, where they are scored against your resume. Required: company, "
+        "title. Optional: " + ", ".join(POSTING_COLUMNS[2:]) + ". Aliases like 'Company Name', 'Role', "
+        "'Position', 'URL', 'Apply By', 'Job Description' also work. Try `sample_postings.csv`."
+    )
+    posting_aliases = {
+        "company name": "company", "employer": "company", "organization": "company",
+        "role": "title", "position": "title", "job title": "title",
+        "url": "link", "apply link": "link", "posting url": "link", "application link": "link",
+        "apply by": "deadline", "due date": "deadline", "expiration date": "deadline",
+        "job description": "description", "details": "description", "summary": "description",
+        "posted": "date_posted", "date posted": "date_posted", "salary": "pay",
+        "site": "source", "board": "source",
+    }
+    up2 = st.file_uploader("Postings CSV file", type=["csv"], key="postings_csv")
+    default_source2 = st.selectbox("Source to use when the CSV has none", SOURCES, key="postings_source")
+    if up2 is not None:
+        raw = pd.read_csv(up2)
+        rename = {}
+        for c in raw.columns:
+            key = c.strip().lower()
+            if key in POSTING_COLUMNS:
+                rename[c] = key
+            elif key.replace(" ", "_") in POSTING_COLUMNS:
+                rename[c] = key.replace(" ", "_")
+            elif key in posting_aliases:
+                rename[c] = posting_aliases[key]
+        df = raw.rename(columns=rename)
+        df = df.loc[:, ~df.columns.duplicated()]
+        if "company" not in df.columns or "title" not in df.columns:
+            st.error(f"Could not find company and title columns. Found: {list(raw.columns)}")
+        else:
+            st.dataframe(df.head(20), width="stretch")
+            if st.button(f"Import {len(df)} postings", type="primary"):
+                existing_p = load_df("postings")
+                seen = (set(zip(existing_p["company"].str.lower(), existing_p["title"].str.lower()))
+                        if not existing_p.empty else set())
+                added = 0
+                for rec in df.to_dict("records"):
+                    if not _clean(rec.get("company")) or not _clean(rec.get("title")):
+                        continue
+                    k = (str(rec["company"]).strip().lower(), str(rec["title"]).strip().lower())
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    if not _clean(rec.get("source")):
+                        rec["source"] = default_source2
+                    for dc in ("date_posted", "date_found", "deadline"):
+                        if _clean(rec.get(dc)):
+                            parsed = pd.to_datetime(rec[dc], errors="coerce")
+                            rec[dc] = None if pd.isna(parsed) else parsed.date()
+                    if not _clean(rec.get("date_found")):
+                        rec["date_found"] = date.today()
+                    insert_posting(rec)
+                    added += 1
+                st.success(f"Imported {added} posting(s). Open **Relevant jobs** to see them ranked.")
+
+    postings = load_df("postings")
+    st.download_button("Download job postings CSV", postings.to_csv(index=False), "postings.csv", "text/csv",
+                       disabled=postings.empty)
+
     st.subheader("Backup")
     st.caption(f"Your database file is `{DB_PATH}`. Copy it somewhere safe (or into cloud storage) to back up everything.")
 
@@ -709,6 +1071,7 @@ def main() -> None:
     init_db()
     pages = {
         "Dashboard": page_dashboard,
+        "Relevant jobs": page_relevant_jobs,
         "Add application": page_add,
         "Applications": page_applications,
         "Contacts": page_contacts,

@@ -1,0 +1,4 @@
+company,title,source,link,location,deadline,description
+Example Tech,Software Engineering Intern - Summer 2027 (Sophomores),Handshake,https://app.joinhandshake.com/stu/postings,Remote,2027-01-31,"Open to freshman and sophomore students. Work in Java or Python, write JUnit tests, use Git and build REST API services."
+Example Genomics,Bioinformatics Intern - Summer 2027,Internships.com,https://www.internships.com/,"Rockville, MD",2027-02-15,"Analyze DNA sequencing data with Python and BLAST, query GenBank, and present findings. Undergraduates in biology or computer science welcome."
+Example Corp,Senior Software Engineer,LinkedIn,https://www.linkedin.com/jobs/,"New York, NY",,"Full-time role. 5+ years of experience with C++ and distributed systems."
