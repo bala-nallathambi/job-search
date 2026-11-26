@@ -15,6 +15,8 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import crawler
+
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 DB_PATH = DATA_DIR / "jobsearch.db"
@@ -160,8 +162,28 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status);
             CREATE INDEX IF NOT EXISTS idx_applications_deadline ON applications(deadline);
             CREATE INDEX IF NOT EXISTS idx_status_history_app ON status_history(app_id);
+            CREATE INDEX IF NOT EXISTS idx_postings_link ON postings(link);
+            -- Public job feeds that "Crawl and refresh" pulls from.
+            CREATE TABLE IF NOT EXISTS crawl_sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,            -- simplify | greenhouse | lever
+                name TEXT NOT NULL,
+                target TEXT,                   -- JSON URL (simplify) or board name (greenhouse / lever)
+                enabled INTEGER DEFAULT 1,
+                last_run TEXT,
+                last_status TEXT,
+                last_added INTEGER
+            );
             """
         )
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(postings)")}
+        if "origin" not in cols:
+            conn.execute("ALTER TABLE postings ADD COLUMN origin TEXT DEFAULT 'manual'")
+        if conn.execute("SELECT COUNT(*) FROM crawl_sources").fetchone()[0] == 0:
+            conn.executemany(
+                "INSERT INTO crawl_sources (kind, name, target) VALUES (?, ?, ?)",
+                [("simplify", "SimplifyJobs Summer 2027 list (GitHub)", crawler.SIMPLIFY_DEFAULT_URL)],
+            )
 
 
 APP_COLUMNS = [
@@ -349,15 +371,55 @@ def _posting_values(record: dict) -> tuple[list, int, str, str]:
     return values, score, ", ".join(matched), "; ".join(reasons)
 
 
-def insert_posting(record: dict) -> int:
+def insert_posting(record: dict, conn: sqlite3.Connection | None = None) -> int:
     values, score, matched, reasons = _posting_values(record)
+    sql = (f"INSERT INTO postings ({', '.join(POSTING_COLUMNS)}, relevance, matched_skills, reasons, status, "
+           f"origin) VALUES ({', '.join('?' * (len(POSTING_COLUMNS) + 5))})")
+    params = values + [score, matched, reasons, _clean(record.get("status")) or "New",
+                       _clean(record.get("origin")) or "manual"]
+    if conn is not None:
+        return conn.execute(sql, params).lastrowid
+    with get_conn() as c:
+        return c.execute(sql, params).lastrowid
+
+
+CRAWL_KINDS = {"simplify": "GitHub list (SimplifyJobs format)", "greenhouse": "Greenhouse board",
+               "lever": "Lever board"}
+
+
+def run_crawl(term: str = "Summer 2027") -> list[dict]:
+    """Fetch every enabled source, add postings with new links, and return a per-source summary."""
     with get_conn() as conn:
-        cur = conn.execute(
-            f"INSERT INTO postings ({', '.join(POSTING_COLUMNS)}, relevance, matched_skills, reasons, status) "
-            f"VALUES ({', '.join('?' * (len(POSTING_COLUMNS) + 4))})",
-            values + [score, matched, reasons, _clean(record.get("status")) or "New"],
-        )
-        return cur.lastrowid
+        sources = conn.execute("SELECT * FROM crawl_sources WHERE enabled=1 ORDER BY id").fetchall()
+        known = {r[0] for r in conn.execute("SELECT link FROM postings WHERE link IS NOT NULL")}
+    summary = []
+    for src in sources:
+        row = dict(source=src["name"], found=0, added=0, error=None)
+        try:
+            items = crawler.crawl_source(src["kind"], src["target"], src["name"], term)
+            row["found"] = len(items)
+            with get_conn() as conn:
+                for item in items:
+                    if item["link"] in known:
+                        continue
+                    known.add(item["link"])
+                    item.update(source="Company careers page" if src["kind"] != "simplify"
+                                else "GitHub list (SimplifyJobs)",
+                                date_found=date.today(), origin=f"crawl:{src['name']}")
+                    insert_posting(item, conn)
+                    row["added"] += 1
+            status = f"OK: {row['found']} found, {row['added']} new"
+        except crawler.CrawlError as e:
+            row["error"] = str(e)
+            status = f"Failed: {e}"
+        except Exception as e:  # keep one bad source from stopping the rest
+            row["error"] = f"{type(e).__name__}: {e}"
+            status = f"Failed: {row['error']}"
+        with get_conn() as conn:
+            conn.execute("UPDATE crawl_sources SET last_run=?, last_status=?, last_added=? WHERE id=?",
+                         (datetime.now().isoformat(timespec="minutes"), status, row["added"], src["id"]))
+        summary.append(row)
+    return summary
 
 
 def update_posting(posting_id: int, record: dict) -> None:
@@ -384,12 +446,14 @@ def rescore_all_postings() -> int:
     return len(df)
 
 
-def posting_to_application(posting_id: int) -> int | None:
+def posting_to_application(posting_id: int, status: str = "Interested") -> int | None:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM postings WHERE id=?", (posting_id,)).fetchone()
     if row is None:
         return None
     if row["application_id"]:
+        if status != "Interested":
+            mark_applied([row["application_id"]])
         return row["application_id"]
     text = f"{row['title']} {row['description'] or ''}".lower()
     track = next((t for k, t in [
@@ -401,7 +465,8 @@ def posting_to_application(posting_id: int) -> int | None:
     ] if _mentions(text, k)), "Other")
     app_id = insert_application(dict(
         company=row["company"], role=row["title"], track=track, location=row["location"],
-        source=row["source"], link=row["link"], status="Interested",
+        source=row["source"], link=row["link"], status=status,
+        date_applied=date.today() if status == "Applied" else None,
         priority="High" if (row["relevance"] or 0) >= 70 else "Medium",
         date_found=row["date_found"] or date.today(), deadline=row["deadline"], pay=row["pay"],
         notes=f"From job postings (relevance {row['relevance']}). {row['reasons'] or ''}".strip(),
@@ -410,6 +475,14 @@ def posting_to_application(posting_id: int) -> int | None:
         conn.execute("UPDATE postings SET status='Added to applications', application_id=?, "
                      "updated_at=CURRENT_TIMESTAMP WHERE id=?", (app_id, posting_id))
     return app_id
+
+
+def mark_applied(app_ids: list[int]) -> None:
+    with get_conn() as conn:
+        for aid in app_ids:
+            conn.execute("UPDATE applications SET status='Applied', date_applied=COALESCE(date_applied, ?), "
+                         "updated_at=CURRENT_TIMESTAMP WHERE id=?", (date.today().isoformat(), aid))
+            conn.execute("INSERT INTO status_history (app_id, status) VALUES (?, 'Applied')", (aid,))
 
 
 # ---------------------------------------------------------------- helpers
@@ -454,11 +527,141 @@ def link_column_config() -> dict:
 # ---------------------------------------------------------------- pages
 
 
+def render_crawl_controls(key: str) -> None:
+    with get_conn() as conn:
+        last = conn.execute("SELECT MAX(last_run) FROM crawl_sources WHERE enabled=1").fetchone()[0]
+        n_sources = conn.execute("SELECT COUNT(*) FROM crawl_sources WHERE enabled=1").fetchone()[0]
+    c1, c2 = st.columns([1, 3])
+    clicked = c1.button("Crawl and refresh", type="primary", key=f"crawl_{key}", disabled=not n_sources,
+                        help="Pulls new postings from the public feeds listed under Job postings > Crawl sources.")
+    c2.caption(
+        f"{n_sources} source(s) enabled. Last crawl: {last or 'never'}. Only public feeds are crawled "
+        "(the SimplifyJobs GitHub list, Greenhouse and Lever boards). Handshake, LinkedIn and Indeed need a "
+        "login or forbid crawling, so use **Job sites** and CSV import for those."
+    )
+    if clicked:
+        with st.spinner("Fetching postings..."):
+            summary = run_crawl()
+        added = sum(r["added"] for r in summary)
+        failed = [r for r in summary if r["error"]]
+        msg = f"Added {added} new posting(s) from {len(summary) - len(failed)} source(s)."
+        (st.warning if failed else st.success)(msg)
+        for r in summary:
+            if r["error"]:
+                st.caption(f"{r['source']}: could not refresh ({r['error']}). Other sources were still updated.")
+            else:
+                st.caption(f"{r['source']}: {r['found']} matching posting(s), {r['added']} new.")
+
+
+def apply_next_frame() -> pd.DataFrame:
+    """Postings you have not applied to yet, plus applications still at Interested."""
+    posts = load_df("postings")
+    posts = posts[posts["status"].isin(["New", "Saved"]) & posts["application_id"].isna()] if not posts.empty else posts
+    apps = load_df("applications")
+    apps = apps[apps["status"] == "Interested"] if not apps.empty else apps
+    rows = []
+    for r in posts.to_dict("records"):
+        rows.append(dict(key=f"p{r['id']}", kind="Posting" if r["status"] == "New" else "Saved posting",
+                         company=r["company"], role=r["title"], relevance=r["relevance"], location=r["location"],
+                         posted=r["date_posted"] if r["date_posted"] is not None and not pd.isna(r["date_posted"])
+                         else r["date_found"], deadline=r["deadline"], why=r["reasons"], link=r["link"]))
+    for r in apps.to_dict("records"):
+        rows.append(dict(key=f"a{r['id']}", kind="Tracked, not applied", company=r["company"], role=r["role"],
+                         relevance=None, location=r["location"], posted=r["date_found"], deadline=r["deadline"],
+                         why=r["notes"], link=r["link"]))
+    df = pd.DataFrame(rows, columns=["key", "kind", "company", "role", "relevance", "location", "posted",
+                                     "deadline", "why", "link"])
+    df["days_left"] = df["deadline"].apply(days_until)
+    return df[df["days_left"].isna() | (df["days_left"] >= 0)]
+
+
+def render_apply_next() -> None:
+    st.subheader("Apply next")
+    st.caption("Recent postings that fit your resume and that you have not applied to yet, together with jobs "
+               "you are tracking as Interested.")
+    df = apply_next_frame()
+    if df.empty:
+        st.info("Nothing waiting. Press **Crawl and refresh**, or add postings from **Job postings**.")
+        return
+    c1, c2, c3, c4 = st.columns(4)
+    min_score = c1.slider("Minimum relevance", 0, 100, 45, step=5, key="an_score")
+    posted_within = c2.selectbox("Posted", ["Any time", "Last 7 days", "Last 14 days", "Last 30 days"],
+                                 index=2, key="an_posted")
+    order = c3.selectbox("Sort by", ["Newest", "Deadline soonest", "Best match"], key="an_sort")
+    text_f = c4.text_input("Search company / role", key="an_text")
+
+    view = df[df["relevance"].isna() | (df["relevance"] >= min_score)].copy()
+    if posted_within != "Any time":
+        cutoff = date.today() - timedelta(days=int(posted_within.split()[1]))
+        view = view[view["posted"].apply(lambda d: d is None or pd.isna(d) or d >= cutoff)
+                    | (view["kind"] == "Tracked, not applied")]
+    if text_f:
+        view = view[view["company"].fillna("").str.contains(text_f, case=False, regex=False)
+                    | view["role"].fillna("").str.contains(text_f, case=False, regex=False)]
+    sort = {"Newest": (["posted", "relevance"], [False, False]),
+            "Deadline soonest": (["deadline", "relevance"], [True, False]),
+            "Best match": (["relevance", "posted"], [False, False])}[order]
+    view = view.sort_values(sort[0], ascending=sort[1], na_position="last")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("To apply", len(view))
+    m2.metric("Strong match (70+)", int((view["relevance"].fillna(0) >= 70).sum()))
+    m3.metric("Due in 14 days", int((view["days_left"].notna() & (view["days_left"] <= 14)).sum()))
+    if view.empty:
+        st.caption("Nothing matches these filters. Try a lower minimum relevance or a longer posted window.")
+        return
+
+    limit = 100
+    if len(view) > limit:
+        st.caption(f"Showing the top {limit} of {len(view)}. Narrow the filters to see others.")
+    view = view.head(limit)
+    view.insert(0, "select", False)
+    shown = ["select", "kind", "relevance", "company", "role", "location", "posted", "deadline", "days_left",
+             "why", "link", "key"]
+    picked = st.data_editor(
+        view[shown], hide_index=True, width="stretch", key="apply_next_editor",
+        disabled=[c for c in shown if c != "select"],
+        column_config={
+            "select": st.column_config.CheckboxColumn("Pick"),
+            "kind": st.column_config.TextColumn("Type"),
+            "relevance": st.column_config.ProgressColumn("Relevance", min_value=0, max_value=100, format="%d"),
+            "posted": st.column_config.DateColumn("Posted"),
+            "deadline": st.column_config.DateColumn("Deadline"),
+            "days_left": st.column_config.NumberColumn("Days left"),
+            "link": st.column_config.LinkColumn("Link", display_text="apply"),
+            "key": None,
+        },
+    )
+    keys = list(picked.loc[picked["select"], "key"])
+    post_ids = [int(k[1:]) for k in keys if k.startswith("p")]
+    app_ids = [int(k[1:]) for k in keys if k.startswith("a")]
+    c1, c2, c3 = st.columns(3)
+    if c1.button(f"Mark {len(keys)} applied", type="primary", disabled=not keys):
+        for pid in post_ids:
+            posting_to_application(pid, status="Applied")
+        mark_applied(app_ids)
+        st.success(f"Marked {len(keys)} as Applied. They now appear under Applications.")
+        st.rerun()
+    if c2.button("Track as Interested", disabled=not post_ids,
+                 help="Copies the picked postings into Applications without marking them applied."):
+        for pid in post_ids:
+            posting_to_application(pid)
+        st.rerun()
+    if c3.button("Dismiss", disabled=not post_ids, help="Hides the picked postings. Tracked jobs are not affected."):
+        set_posting_status(post_ids, "Dismissed")
+        st.rerun()
+
+
 def page_dashboard() -> None:
     st.title("Summer 2027 Internship Dashboard")
+    render_crawl_controls("dash")
+    render_apply_next()
+    st.divider()
+    st.subheader("Applications")
     df = load_df("applications")
     if df.empty:
-        st.info("No applications yet. Add one from **Add application**, or import a CSV.")
+        st.info("No applications yet. Mark a posting above as applied, add one from **Add application**, "
+                "or import a CSV.")
         return
 
     today = date.today()
@@ -528,8 +731,54 @@ def page_dashboard() -> None:
         st.error(f"{len(overdue)} saved posting(s) passed their deadline without an application.")
 
 
+def render_crawl_sources() -> None:
+    st.caption(
+        "Public feeds that **Crawl and refresh** reads. For a company's own board, find its Greenhouse or Lever "
+        "name in the careers page address: job-boards.greenhouse.io/**name** or jobs.lever.co/**name**. "
+        "Only titles that mention intern, internship or co-op are kept."
+    )
+    with get_conn() as conn:
+        src = pd.read_sql_query("SELECT * FROM crawl_sources ORDER BY id", conn)
+    src["enabled"] = src["enabled"].astype(bool)
+    edited = st.data_editor(
+        src[["id", "enabled", "name", "kind", "target", "last_run", "last_status"]], hide_index=True,
+        width="stretch", key="sources_editor", disabled=["id", "kind", "last_run", "last_status"],
+        column_config={"id": None, "enabled": st.column_config.CheckboxColumn("On"),
+                       "kind": st.column_config.TextColumn("Type"),
+                       "target": st.column_config.TextColumn("Feed URL / board name")},
+    )
+    c1, c2 = st.columns([1, 3])
+    if c1.button("Save sources"):
+        with get_conn() as conn:
+            for r in edited.to_dict("records"):
+                conn.execute("UPDATE crawl_sources SET enabled=?, name=?, target=? WHERE id=?",
+                             (int(bool(r["enabled"])), r["name"], r["target"], int(r["id"])))
+        st.rerun()
+    with st.form("add_source", clear_on_submit=True):
+        c1, c2, c3 = st.columns([1, 1, 2])
+        kind = c1.selectbox("Type", list(CRAWL_KINDS), format_func=CRAWL_KINDS.get)
+        name = c2.text_input("Company / label *")
+        target = c3.text_input("Board name or JSON URL *", placeholder="e.g. stripe")
+        if st.form_submit_button("Add source"):
+            if name.strip() and target.strip():
+                with get_conn() as conn:
+                    conn.execute("INSERT INTO crawl_sources (kind, name, target) VALUES (?, ?, ?)",
+                                 (kind, name.strip(), target.strip()))
+                st.rerun()
+            else:
+                st.error("Label and board name are required.")
+    removable = {f"{r.name} ({r.kind})": int(r.id) for r in src.itertuples()}
+    gone = st.multiselect("Remove sources", list(removable), key="rm_sources")
+    if st.button("Remove selected sources", disabled=not gone):
+        delete_rows("crawl_sources", [removable[g] for g in gone])
+        st.rerun()
+
+
 def page_relevant_jobs() -> None:
-    st.title("Relevant jobs")
+    st.title("Job postings")
+    render_crawl_controls("postings")
+    with st.expander("Crawl sources", expanded=False):
+        render_crawl_sources()
     st.caption(
         "Job postings you have collected, scored 0-100 against your resume: internship, target role "
         "(SWE, bioinformatics, research, data), Summer 2027, open to sophomores, and resume skills. "
@@ -605,6 +854,9 @@ def page_relevant_jobs() -> None:
         st.caption("No postings match these filters. Try lowering the minimum relevance.")
         return
 
+    if len(view) > 200:
+        st.caption(f"Showing the top 200 of {len(view)}. Narrow the filters to see others.")
+        view = view.head(200)
     view.insert(0, "select", False)
     shown = ["select", "id", "relevance", "company", "title", "location", "source", "deadline",
              "days_left", "matched_skills", "reasons", "status", "link"]
@@ -999,7 +1251,7 @@ def page_import_export() -> None:
 
     st.subheader("Import job postings from CSV")
     st.caption(
-        "Postings go to **Relevant jobs**, where they are scored against your resume. Required: company, "
+        "Postings go to **Job postings** and the Dashboard, where they are scored against your resume. Required: company, "
         "title. Optional: " + ", ".join(POSTING_COLUMNS[2:]) + ". Aliases like 'Company Name', 'Role', "
         "'Position', 'URL', 'Apply By', 'Job Description' also work. Try `sample_postings.csv`."
     )
@@ -1053,7 +1305,7 @@ def page_import_export() -> None:
                         rec["date_found"] = date.today()
                     insert_posting(rec)
                     added += 1
-                st.success(f"Imported {added} posting(s). Open **Relevant jobs** to see them ranked.")
+                st.success(f"Imported {added} posting(s). Open **Dashboard** or **Job postings** to see them ranked.")
 
     postings = load_df("postings")
     st.download_button("Download job postings CSV", postings.to_csv(index=False), "postings.csv", "text/csv",
@@ -1071,7 +1323,7 @@ def main() -> None:
     init_db()
     pages = {
         "Dashboard": page_dashboard,
-        "Relevant jobs": page_relevant_jobs,
+        "Job postings": page_relevant_jobs,
         "Add application": page_add,
         "Applications": page_applications,
         "Contacts": page_contacts,
